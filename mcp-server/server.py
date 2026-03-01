@@ -203,6 +203,45 @@ def next_arrivals(stop_id: str, minutes: int = 30, headsign: str = "", route: st
 
     return results
 
+@mcp.tool()
+def vehicle_positions(route: str) -> list[dict]:
+    """
+    Trenutne GPS pozicije svih vozila određene linije.
+    Parametar route je kratki naziv linije, npr. '5' ili '13'.
+    Vraća: route, trip_id, lat, lon, speed, bearing, updated_at.
+    """
+    con = get_db()
+    rows = con.execute(
+        """
+        SELECT
+            v.route_id,
+            v.trip_id,
+            v.lat,
+            v.lon,
+            v.speed,
+            v.bearing,
+            v.updated_at
+        FROM rt_vehicles v
+        JOIN routes r ON v.route_id = r.route_id
+        WHERE r.short_name = ?
+        ORDER BY v.updated_at DESC
+        """,
+        (route,)
+    ).fetchall()
+
+    return [
+        {
+            "route":      r["route_id"],
+            "trip_id":    r["trip_id"],
+            "lat":        r["lat"],
+            "lon":        r["lon"],
+            "speed":      r["speed"],
+            "bearing":    r["bearing"],
+            "updated_at": datetime.fromtimestamp(r["updated_at"], TZ).strftime("%H:%M:%S"),
+        }
+        for r in rows
+    ]
+
 
 if __name__ == "__main__":
     import sys
