@@ -1,16 +1,196 @@
+import sqlite3
+import os
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 from fastmcp import FastMCP
+
+DB_PATH = os.getenv("DB_PATH", "/data/zet.db")
+TZ = ZoneInfo("Europe/Zagreb")
 
 mcp = FastMCP("ZET Tramvaji 🚃")
 
-@mcp.tool()
-def find_stops(name: str) -> str:
-    """Pronađi stajališta po imenu."""
-    return f"TODO: pretraži SQLite za '{name}'"
+
+def get_db() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def get_active_service_ids(con: sqlite3.Connection) -> list[str]:
+    """Vraća service_id-eve koji voze danas."""
+    today = date.today().strftime("%Y%m%d")
+    rows = con.execute(
+        "SELECT service_id FROM calendar_dates WHERE date = ? AND exception_type = 1",
+        (today,)
+    ).fetchall()
+    return [r["service_id"] for r in rows]
+
+
+def normalize_time(t: str) -> str:
+    """GTFS dozvoljava 25:10:00 za poslije ponoći — normaliziramo za usporedbu."""
+    parts = t.split(":")
+    h = int(parts[0])
+    if h >= 24:
+        parts[0] = str(h - 24).zfill(2)
+    return ":".join(parts)
+
 
 @mcp.tool()
-def next_departures(stop_id: str, minutes: int = 30) -> str:
-    """Iduća polazišta s određenog stajališta."""
-    return f"TODO: vrati polazišta za stop {stop_id} u narednih {minutes} min"
+def search_stops(name: str) -> list[dict]:
+    """
+    Pretraži stajališta ZET-a po imenu (djelomično podudaranje).
+    Vraća listu stajališta s ID-em, imenom i koordinatama.
+    """
+    con = get_db()
+    rows = con.execute(
+        """
+        SELECT stop_id, stop_name, lat, lon, parent_station
+        FROM stops
+        WHERE stop_name LIKE ? AND (parent_station = '' OR parent_station IS NULL)
+        ORDER BY stop_name
+        LIMIT 20
+        """,
+        (f"%{name}%",)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@mcp.tool()
+def routes_at_stop(stop_id: str) -> list[dict]:
+    """
+    Koje linije (rute) staju na određenom stajalištu danas.
+    Vrati route_id, kratko ime linije, dugo ime i krajnje odredište (headsign).
+    """
+    con = get_db()
+    service_ids = get_active_service_ids(con)
+    if not service_ids:
+        return []
+
+    placeholders = ",".join("?" * len(service_ids))
+
+    child_stops = con.execute(
+        "SELECT stop_id FROM stops WHERE stop_id = ? OR parent_station = ?",
+        (stop_id, stop_id)
+    ).fetchall()
+    child_ids = [r["stop_id"] for r in child_stops]
+    stop_placeholders = ",".join("?" * len(child_ids))
+
+    rows = con.execute(
+        f"""
+        SELECT DISTINCT
+            r.route_id,
+            r.short_name,
+            r.long_name,
+            t.headsign,
+            t.direction_id
+        FROM stop_times st
+        JOIN trips t ON st.trip_id = t.trip_id
+        JOIN routes r ON t.route_id = r.route_id
+        WHERE st.stop_id IN ({stop_placeholders})
+          AND t.service_id IN ({placeholders})
+        ORDER BY CAST(r.short_name AS INTEGER), t.direction_id
+        """,
+        (*child_ids, *service_ids)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@mcp.tool()
+def next_arrivals(stop_id: str, minutes: int = 30) -> list[dict]:
+    """
+    Iduća dolazišta na stajalištu u sljedećih N minuta.
+    Uključuje RT korekciju ako je dostupna.
+    Vraća: route short_name, headsign, scheduled_time, realtime_time, delay_seconds.
+    """
+    con = get_db()
+    service_ids = get_active_service_ids(con)
+    if not service_ids:
+        return []
+
+    now = datetime.now(TZ)
+
+    now_naive = datetime.now(TZ).replace(tzinfo=None)
+    window_end = now_naive + timedelta(minutes=minutes)
+
+    now_str = now_naive.strftime("%H:%M:%S")
+    end_str = window_end.strftime("%H:%M:%S")
+
+    child_stops = con.execute(
+        "SELECT stop_id FROM stops WHERE stop_id = ? OR parent_station = ?",
+        (stop_id, stop_id)
+    ).fetchall()
+    child_ids = [r["stop_id"] for r in child_stops]
+    stop_placeholders = ",".join("?" * len(child_ids))
+    placeholders = ",".join("?" * len(service_ids))
+
+    rows = con.execute(
+        f"""
+        SELECT
+            st.trip_id,
+            st.stop_id,
+            st.departure_time,
+            r.short_name   AS route_name,
+            t.headsign,
+            t.direction_id
+        FROM stop_times st
+        JOIN trips t ON st.trip_id = t.trip_id
+        JOIN routes r ON t.route_id = r.route_id
+        WHERE st.stop_id IN ({stop_placeholders})
+          AND t.service_id IN ({placeholders})
+          AND st.departure_time >= ?
+          AND st.departure_time <= ?
+        ORDER BY st.departure_time
+        LIMIT 20
+        """,
+        (*child_ids, *service_ids, now_str, end_str)
+    ).fetchall()
+
+    trip_ids = [r["trip_id"] for r in rows]
+    rt_map = {}
+    if trip_ids:
+        rt_placeholders = ",".join("?" * len(trip_ids))
+        rt_rows = con.execute(
+            f"""
+            SELECT trip_id, stop_id, departure_time, arrival_time
+            FROM rt_updates
+            WHERE trip_id IN ({rt_placeholders})
+            """,
+            trip_ids
+        ).fetchall()
+        for rt in rt_rows:
+            rt_map[(rt["trip_id"], rt["stop_id"])] = rt
+
+    results = []
+    for r in rows:
+        scheduled = r["departure_time"]
+        rt = rt_map.get((r["trip_id"], r["stop_id"]))
+
+        realtime_time = None
+        delay_seconds = None
+        if rt and rt["departure_time"]:
+            rt_dt = datetime.fromtimestamp(rt["departure_time"], TZ).replace(tzinfo=None)
+            realtime_time = rt_dt.strftime("%H:%M:%S")
+
+            sched_dt = datetime.strptime(
+                f"{now_naive.date()} {normalize_time(scheduled)}", "%Y-%m-%d %H:%M:%S"
+            )
+            delay_seconds = int((rt_dt - sched_dt).total_seconds())
+
+        results.append({
+            "route":          r["route_name"],
+            "headsign":       r["headsign"],
+            "scheduled_time": scheduled,
+            "realtime_time":  realtime_time,
+            "delay_seconds":  delay_seconds,
+        })
+
+    return results
+
 
 if __name__ == "__main__":
-    mcp.run(transport="sse", port=8000)
+    import sys
+    transport = sys.argv[1] if len(sys.argv) > 1 else "sse"
+    if transport == "sse":
+        mcp.run(transport="sse", host="0.0.0.0", port=8000)
+    else:
+        mcp.run(transport="stdio")

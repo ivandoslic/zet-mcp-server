@@ -1,2 +1,4 @@
 mcp[cli]
 fastmcp
+gtfs-realtime-bindings
+protobuf
