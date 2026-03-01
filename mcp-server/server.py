@@ -242,6 +242,65 @@ def vehicle_positions(route: str) -> list[dict]:
         for r in rows
     ]
 
+@mcp.tool()
+def last_departure(stop_id: str, route: str = "", headsign: str = "") -> list[dict]:
+    """
+    Zadnje polazište danas s određenog stajališta.
+    Opcionalno filtrira po liniji (route), npr. '5' ili '13'.
+    Opcionalno filtrira po odredištu (headsign), npr. 'Borongaj'.
+    Vraća: route, headsign, scheduled_time za zadnje polazište danas.
+    """
+    con = get_db()
+    service_ids = get_active_service_ids(con)
+    if not service_ids:
+        return []
+
+    child_stops = con.execute(
+        "SELECT stop_id FROM stops WHERE stop_id = ? OR parent_station = ?",
+        (stop_id, stop_id)
+    ).fetchall()
+    child_ids = [r["stop_id"] for r in child_stops]
+    stop_placeholders = ",".join("?" * len(child_ids))
+    svc_placeholders = ",".join("?" * len(service_ids))
+
+    headsign_clause = "AND LOWER(t.headsign) LIKE LOWER(?)" if headsign else ""
+    route_clause = "AND r.short_name = ?" if route else ""
+
+    params = [
+        *child_ids,
+        *service_ids,
+        *([f"%{headsign}%"] if headsign else []),
+        *([route] if route else []),
+    ]
+
+    rows = con.execute(
+        f"""
+        SELECT
+            r.short_name  AS route_name,
+            t.headsign,
+            MAX(st.departure_time) AS last_departure_time
+        FROM stop_times st
+        JOIN trips t ON st.trip_id = t.trip_id
+        JOIN routes r ON t.route_id = r.route_id
+        WHERE st.stop_id IN ({stop_placeholders})
+          AND t.service_id IN ({svc_placeholders})
+          {headsign_clause}
+          {route_clause}
+        GROUP BY r.short_name, t.headsign
+        ORDER BY last_departure_time DESC
+        LIMIT 20
+        """,
+        params
+    ).fetchall()
+
+    return [
+        {
+            "route":      r["route_name"],
+            "headsign":   r["headsign"],
+            "last_departure": r["last_departure_time"],
+        }
+        for r in rows
+    ]
 
 if __name__ == "__main__":
     import sys
