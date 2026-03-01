@@ -44,9 +44,14 @@ def search_stops(name: str) -> list[dict]:
     con = get_db()
     rows = con.execute(
         """
-        SELECT stop_id, stop_name, lat, lon, parent_station
+        SELECT
+            COALESCE(NULLIF(parent_station, ''), stop_id) AS stop_id,
+            stop_name,
+            AVG(lat) AS lat,
+            AVG(lon) AS lon
         FROM stops
-        WHERE stop_name LIKE ? AND (parent_station = '' OR parent_station IS NULL)
+        WHERE stop_name LIKE ?
+        GROUP BY COALESCE(NULLIF(parent_station, ''), stop_id), stop_name
         ORDER BY stop_name
         LIMIT 20
         """,
