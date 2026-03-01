@@ -101,10 +101,12 @@ def routes_at_stop(stop_id: str) -> list[dict]:
 
 
 @mcp.tool()
-def next_arrivals(stop_id: str, minutes: int = 30) -> list[dict]:
+def next_arrivals(stop_id: str, minutes: int = 30, headsign: str = "", route: str = "") -> list[dict]:
     """
     Iduća dolazišta na stajalištu u sljedećih N minuta.
     Uključuje RT korekciju ako je dostupna.
+    Opcionalno filtrira po odredištu (headsign), npr. 'Borongaj' ili 'Prečko'.
+    Opcionalno filtrira po liniji (route), npr. '5' ili '13'.
     Vraća: route short_name, headsign, scheduled_time, realtime_time, delay_seconds.
     """
     con = get_db()
@@ -112,11 +114,8 @@ def next_arrivals(stop_id: str, minutes: int = 30) -> list[dict]:
     if not service_ids:
         return []
 
-    now = datetime.now(TZ)
-
     now_naive = datetime.now(TZ).replace(tzinfo=None)
     window_end = now_naive + timedelta(minutes=minutes)
-
     now_str = now_naive.strftime("%H:%M:%S")
     end_str = window_end.strftime("%H:%M:%S")
 
@@ -126,7 +125,19 @@ def next_arrivals(stop_id: str, minutes: int = 30) -> list[dict]:
     ).fetchall()
     child_ids = [r["stop_id"] for r in child_stops]
     stop_placeholders = ",".join("?" * len(child_ids))
-    placeholders = ",".join("?" * len(service_ids))
+    svc_placeholders = ",".join("?" * len(service_ids))
+
+    headsign_clause = "AND LOWER(t.headsign) LIKE LOWER(?)" if headsign else ""
+    route_clause = "AND r.short_name = ?" if route else ""
+
+    params = [
+        *child_ids,
+        *service_ids,
+        now_str,
+        end_str,
+        *([f"%{headsign}%"] if headsign else []),
+        *([route] if route else []),
+    ]
 
     rows = con.execute(
         f"""
@@ -141,13 +152,15 @@ def next_arrivals(stop_id: str, minutes: int = 30) -> list[dict]:
         JOIN trips t ON st.trip_id = t.trip_id
         JOIN routes r ON t.route_id = r.route_id
         WHERE st.stop_id IN ({stop_placeholders})
-          AND t.service_id IN ({placeholders})
+          AND t.service_id IN ({svc_placeholders})
           AND st.departure_time >= ?
           AND st.departure_time <= ?
+          {headsign_clause}
+          {route_clause}
         ORDER BY st.departure_time
         LIMIT 20
         """,
-        (*child_ids, *service_ids, now_str, end_str)
+        params
     ).fetchall()
 
     trip_ids = [r["trip_id"] for r in rows]
@@ -175,7 +188,6 @@ def next_arrivals(stop_id: str, minutes: int = 30) -> list[dict]:
         if rt and rt["departure_time"]:
             rt_dt = datetime.fromtimestamp(rt["departure_time"], TZ).replace(tzinfo=None)
             realtime_time = rt_dt.strftime("%H:%M:%S")
-
             sched_dt = datetime.strptime(
                 f"{now_naive.date()} {normalize_time(scheduled)}", "%Y-%m-%d %H:%M:%S"
             )
