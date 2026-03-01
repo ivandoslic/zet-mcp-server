@@ -1,0 +1,21 @@
+services:
+  gtfs-sync:
+    build: ./gtfs-sync
+    container_name: zet-gtfs-sync
+    env_file: .env
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    depends_on: []
+
+  mcp-server:
+    build: ./mcp-server
+    container_name: zet-mcp-server
+    env_file: .env
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    volumes:
+      - ./data:/data:ro
+    restart: unless-stopped
+    depends_on:
+      - gtfs-sync

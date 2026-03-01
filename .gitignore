@@ -1,0 +1,15 @@
+# Data (GTFS download + SQLite)
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Env
+.env
+
+# OS
+.DS_Store
